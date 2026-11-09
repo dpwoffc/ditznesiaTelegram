@@ -1,0 +1,19 @@
+nah setelah klik layanan bot mengirim reqest axios ke 
+${BASE_URL}/order?apikey=${API_KEY}&server=${SERVER_ID}&country=${country}&produk=${produk}&provider=${provider}&operator=${OPERATOR}
+
+repon api:
+{
+    "id": "a1b2c3d4-...",
+    "server": "5",
+    "country": "6",
+    "country_name": "🇮🇩 Indonesia",
+    "service_name": "whatsapp",
+    "number": "628123456784",
+    "otp": "Waiting",
+    "status": "pending",
+    "price": 2500,
+    "created_at": "2026-06-01 10:00:00",
+    "expires_at_ms": 1780000000000
+}
+
+ada button cancel dan cek status yaa walaupun nanti akan dibuat otomatis cek status setiap 2 detik nya, untuk button cancel baru bisa berfungsi setelaah 3 menit dari pemesanan
