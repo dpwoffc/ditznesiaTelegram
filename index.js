@@ -97,7 +97,7 @@ async function runSetup() {
     envData += `CHANNEL_USERNAME=${channelUsername}\n`;
     if (baseUrl) envData += `BASE_URL=${baseUrl}\n`;
     envData += `SERVER_ID=${serverId}\n`;
-    const MARKUP_HARGA = 1000;
+    envData += `MARKUP_HARGA=1000\n`;
 
     fs.writeFileSync(".env", envData);
 
@@ -139,6 +139,8 @@ const API_KEY = clean(process.env.API_KEY);
 const CHANNEL_USERNAME = clean(process.env.CHANNEL_USERNAME);
 const BASE_URL = clean(process.env.BASE_URL) || "";
 const SERVER_ID = clean(process.env.SERVER_ID) || "1";
+const MARKUP_HARGA = Number(clean(process.env.MARKUP_HARGA)) || 1000;
+const MIN_TOPUP = 2000;
 
 if (!BOT_TOKEN || !OWNER_ID || !API_KEY || !CHANNEL_USERNAME) {
     console.error("❌ Error: BOT_TOKEN, OWNER_ID, API_KEY, atau CHANNEL_USERNAME belum diset!");
@@ -290,11 +292,11 @@ async function editToJoinMessage(ctx) {
     const caption = getJoinCaption();
     const extra = { parse_mode: "HTML", reply_markup: getJoinKeyboard() };
     try {
-        await ctx.editMessageText(caption, extra);
+        await ctx.editMessageCaption(caption, extra);
     } catch (e) {
         if (e.message.includes("message is not modified")) return;
         try {
-            await ctx.editMessageCaption(caption, extra);
+            await ctx.editMessageText(caption, extra);
         } catch (e2) {
             if (e2.message.includes("message is not modified")) return;
             console.error("editToJoinMessage fallback:", e2.message);
@@ -335,19 +337,29 @@ bot.use(async (ctx, next) => {
 /* ============================
     ====== HELPER FUNCTION ======
     ============================ */
+/**
+ * Edit pesan existing (caption + reply_markup ATOMIC) atau kirim baru.
+ * - Pesan existing dari bot ini selalu berupa photo (logo) → pakai editMessageCaption
+ * - Kalau ternyata teks → fallback editMessageText
+ * - Tidak re-upload media → tombol tidak flicker/hilang
+ */
 async function editOrSendMessage(ctx, caption, options, photo) {
     try {
         if (ctx.callbackQuery) {
-            if (photo && fs.existsSync(photo)) {
-                await ctx.editMessageMedia({
-                    type: "photo",
-                    media: { source: fs.createReadStream(photo) },
-                    caption: caption,
-                    parse_mode: options.parse_mode
-                });
-                await ctx.editMessageReplyMarkup(options.reply_markup);
-            } else {
-                await ctx.editMessageText(caption, options);
+            // 1) Coba edit caption (pesan existing biasanya berupa foto/logo)
+            try {
+                await ctx.editMessageCaption(caption, options);
+                return;
+            } catch (e1) {
+                if (e1.message.includes("message is not modified")) return;
+                // 2) Fallback: pesan existing berupa teks
+                try {
+                    await ctx.editMessageText(caption, options);
+                    return;
+                } catch (e2) {
+                    if (e2.message.includes("message is not modified")) return;
+                    throw e2;
+                }
             }
         } else {
             if (photo && fs.existsSync(photo)) {
@@ -357,7 +369,6 @@ async function editOrSendMessage(ctx, caption, options, photo) {
             }
         }
     } catch (error) {
-        if (error.message.includes("message is not modified")) return;
         console.error("editOrSendMessage:", error.message);
         if (error.message.includes("query is too old") || error.message.includes("timeout")) {
             try {
@@ -371,6 +382,16 @@ async function editOrSendMessage(ctx, caption, options, photo) {
             throw error;
         }
     }
+}
+
+function applyMarkup(price) {
+    const base = Number(price);
+    if (!Number.isFinite(base) || base <= 0) return price;
+    return base + MARKUP_HARGA;
+}
+
+function formatRupiah(n) {
+    return Number(n || 0).toLocaleString("id-ID");
 }
 
 /* ============================
@@ -435,14 +456,14 @@ async function renderCountryList(ctx, page = 0) {
         const url = `${BASE_URL}/countries?apikey=${API_KEY}&server=${SERVER_ID}`;
         const response = await axios.get(url);
         const countries = Array.isArray(response.data) ? response.data : (response.data.data || []);
-        
+
         if (countries.length === 0) {
             return ctx.answerCbQuery("❌ Tidak ada negara yang tersedia saat ini.", { show_alert: true }).catch(() => {});
         }
 
         const ITEMS_PER_PAGE = 6;
         const totalPages = Math.ceil(countries.length / ITEMS_PER_PAGE);
-        
+
         if (page < 0) page = 0;
         if (page >= totalPages) page = totalPages - 1;
 
@@ -451,7 +472,7 @@ async function renderCountryList(ctx, page = 0) {
         const pageItems = countries.slice(start, end);
 
         const buttons = [];
-        
+
         for (let i = 0; i < pageItems.length; i += 2) {
             const row = [];
             const item1 = pageItems[i];
@@ -477,7 +498,7 @@ async function renderCountryList(ctx, page = 0) {
         buttons.push([Markup.button.callback("🏠 Menu Utama", "start")]);
 
         const caption = `📦 <b>PILIH NEGARA</b>\n\n<i>Halaman ${page + 1} dari ${totalPages}</i>\n\nSilakan pilih negara untuk layanan OTP:`;
-        
+
         const options = {
             parse_mode: "HTML",
             reply_markup: Markup.inlineKeyboard(buttons).reply_markup
@@ -497,14 +518,14 @@ async function renderServiceList(ctx, countryId, page = 0) {
         const url = `${BASE_URL}/services?apikey=${API_KEY}&server=${SERVER_ID}&country=${countryId}`;
         const response = await axios.get(url);
         const services = Array.isArray(response.data) ? response.data : (response.data.data || []);
-        
+
         if (services.length === 0) {
             return ctx.answerCbQuery("❌ Tidak ada layanan di negara ini.", { show_alert: true }).catch(() => {});
         }
 
         const ITEMS_PER_PAGE = 6;
         const totalPages = Math.ceil(services.length / ITEMS_PER_PAGE);
-        
+
         if (page < 0) page = 0;
         if (page >= totalPages) page = totalPages - 1;
 
@@ -513,18 +534,18 @@ async function renderServiceList(ctx, countryId, page = 0) {
         const pageItems = services.slice(start, end);
 
         const buttons = [];
-        
+
         for (let i = 0; i < pageItems.length; i += 2) {
             const row = [];
             const item1 = pageItems[i];
             const item2 = pageItems[i + 1];
 
-            const price1 = Number(item1.price).toLocaleString('id-ID');
+            const price1 = Number(applyMarkup(item1.price)).toLocaleString('id-ID');
             const name1 = (item1.service_name || item1.produk || "Unknown").toUpperCase();
             row.push(Markup.button.callback(`🛠️ ${name1} | ${price1}`, `buy_${countryId}_${item1.id}`));
 
             if (item2) {
-                const price2 = Number(item2.price).toLocaleString('id-ID');
+                const price2 = Number(applyMarkup(item2.price)).toLocaleString('id-ID');
                 const name2 = (item2.service_name || item2.produk || "Unknown").toUpperCase();
                 row.push(Markup.button.callback(`🛠️ ${name2} | ${price2}`, `buy_${countryId}_${item2.id}`));
             }
@@ -540,7 +561,7 @@ async function renderServiceList(ctx, countryId, page = 0) {
         buttons.push([Markup.button.callback("🏠 Menu Utama", "start")]);
 
         const caption = `🛠️ <b>PILIH LAYANAN</b>\n\n📌 Negara ID: <code>${countryId}</code>\n📄 Halaman ${page + 1} dari ${totalPages}\n\n<i>Silakan pilih layanan yang ingin diorder:</i>`;
-        
+
         const options = {
             parse_mode: "HTML",
             reply_markup: Markup.inlineKeyboard(buttons).reply_markup
@@ -583,10 +604,161 @@ bot.action(/^svc_page_(.+)_(\d+)$/, async (ctx) => {
 bot.action(/^buy_(.+)_(.+)$/, async (ctx) => {
     const countryId = ctx.match[1];
     const serviceId = ctx.match[2];
-    
+
     await ctx.answerCbQuery(`Memproses order ${serviceId}...`, { show_alert: true }).catch(() => {});
     console.log(`User ${ctx.from.id} klik order: Negara ${countryId}, Layanan ${serviceId}`);
     // Di sini nanti kamu bisa tambahkan logika untuk memotong saldo & request API order
+});
+
+/* ============================
+    ====== FITUR TOP UP =========
+    ============================ */
+const topupState = new Map(); // userId -> { amount: string }
+
+function getTopupAmount(userId) {
+    const s = topupState.get(userId);
+    return s ? s.amount : "";
+}
+
+function setTopupAmount(userId, amount) {
+    topupState.set(userId, { amount: String(amount || "").slice(0, 9) });
+}
+
+function clearTopupAmount(userId) {
+    topupState.delete(userId);
+}
+
+function buildTopupScreen(userId) {
+    const amountStr = getTopupAmount(userId);
+    const amountNum = Number(amountStr) || 0;
+    const display = amountStr === "" ? "0" : formatRupiah(amountNum);
+    const isEnough = amountNum >= MIN_TOPUP;
+
+    const caption = `
+💰 <b>TOP UP SALDO</b>
+━━━━━━━━━━━━━━━━━━━━
+
+Nominal: <b>Rp ${display}</b>
+Minimal: <b>Rp ${formatRupiah(MIN_TOPUP)}</b>
+
+${amountStr === "" ? "⌨️ <i>Tekan tombol angka di bawah untuk memasukkan nominal.</i>" :
+    isEnough ? "✅ <i>Nominal valid. Tekan <b>Lanjut</b> untuk melanjutkan.</i>"
+             : `⚠️ <i>Nominal masih di bawah minimal Rp ${formatRupiah(MIN_TOPUP)}.</i>`}
+`.trim();
+
+    const buttons = [
+        [
+            Markup.button.callback("1", "tp_1"),
+            Markup.button.callback("2", "tp_2"),
+            Markup.button.callback("3", "tp_3"),
+        ],
+        [
+            Markup.button.callback("4", "tp_4"),
+            Markup.button.callback("5", "tp_5"),
+            Markup.button.callback("6", "tp_6"),
+        ],
+        [
+            Markup.button.callback("7", "tp_7"),
+            Markup.button.callback("8", "tp_8"),
+            Markup.button.callback("9", "tp_9"),
+        ],
+        [
+            Markup.button.callback("0", "tp_0"),
+            Markup.button.callback("⌫ Hapus", "tp_del"),
+            Markup.button.callback("🗑️ Clear", "tp_clear"),
+        ],
+        [
+            Markup.button.callback("✅ Lanjut", "tp_next"),
+        ],
+        [
+            Markup.button.callback("🏠 Menu Utama", "start"),
+        ],
+    ];
+
+    return {
+        caption,
+        options: {
+            parse_mode: "HTML",
+            reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+        }
+    };
+}
+
+bot.action("topup", async (ctx) => {
+    clearTopupAmount(ctx.from.id);
+    const { caption, options } = buildTopupScreen(ctx.from.id);
+    await editOrSendMessage(ctx, caption, options, LOGO_PATH);
+    await ctx.answerCbQuery().catch(() => {});
+});
+
+bot.action(/^tp_(\d)$/, async (ctx) => {
+    const digit = ctx.match[1];
+    const current = getTopupAmount(ctx.from.id);
+    let next = current + digit;
+
+    // hindari angka nol di depan (kecuali single "0")
+    if (current === "0") next = digit;
+    if (current === "" && digit === "0") next = "0";
+    if (next.length > 9) next = next.slice(0, 9);
+
+    setTopupAmount(ctx.from.id, next);
+    const { caption, options } = buildTopupScreen(ctx.from.id);
+    await editOrSendMessage(ctx, caption, options, LOGO_PATH);
+    await ctx.answerCbQuery().catch(() => {});
+});
+
+bot.action("tp_del", async (ctx) => {
+    const current = getTopupAmount(ctx.from.id);
+    const next = current.slice(0, -1);
+    setTopupAmount(ctx.from.id, next);
+    const { caption, options } = buildTopupScreen(ctx.from.id);
+    await editOrSendMessage(ctx, caption, options, LOGO_PATH);
+    await ctx.answerCbQuery().catch(() => {});
+});
+
+bot.action("tp_clear", async (ctx) => {
+    clearTopupAmount(ctx.from.id);
+    const { caption, options } = buildTopupScreen(ctx.from.id);
+    await editOrSendMessage(ctx, caption, options, LOGO_PATH);
+    await ctx.answerCbQuery().catch(() => {});
+});
+
+bot.action("tp_next", async (ctx) => {
+    const amountStr = getTopupAmount(ctx.from.id);
+    const amount = Number(amountStr) || 0;
+
+    if (amount < MIN_TOPUP) {
+        return ctx.answerCbQuery(
+            `❌ Minimal top up Rp ${formatRupiah(MIN_TOPUP)}`,
+            { show_alert: true }
+        ).catch(() => {});
+    }
+
+    await ctx.answerCbQuery("✅ Nominal valid").catch(() => {});
+
+    const caption = `
+🧾 <b>KONFIRMASI TOP UP</b>
+━━━━━━━━━━━━━━━━━━━━
+
+🆔 <b>ID</b>       : <code>${ctx.from.id}</code>
+👤 <b>Nama</b>     : ${ctx.from.first_name || "-"}
+💰 <b>Nominal</b>  : <b>Rp ${formatRupiah(amount)}</b>
+
+<i>Silakan hubungi owner untuk instruksi pembayaran.</i>
+
+⚠️ <b>PENTING:</b>
+Saldo akan ditambahkan setelah pembayaran dikonfirmasi oleh admin.
+`.trim();
+
+    const options = {
+        parse_mode: "HTML",
+        reply_markup: Markup.inlineKeyboard([
+            [Markup.button.url("💬 Hubungi Owner", "https://t.me/dpwoffc")],
+            [Markup.button.callback("🏠 Menu Utama", "start")]
+        ]).reply_markup
+    };
+
+    await editOrSendMessage(ctx, caption, options, LOGO_PATH);
 });
 
 /* ============================
@@ -630,6 +802,8 @@ bot.start(async (ctx) => {
     ====== CALLBACK START =======
     ============================ */
 bot.action("start", async (ctx) => {
+    // bersihkan state topup saat kembali ke menu utama
+    clearTopupAmount(ctx.from.id);
     const { caption, options } = createMainMenu(ctx.from.id, ctx.from.first_name);
     await editOrSendMessage(ctx, caption, options, LOGO_PATH);
 });
@@ -654,6 +828,8 @@ bot.catch((err, ctx) => {
     console.log(`📸 Logo         : ${fs.existsSync(LOGO_PATH) ? "✅ Ada" : "⚠️  Tidak ditemukan"}`);
     console.log(`📢 Channel      : ${CHANNEL_USERNAME}`);
     console.log(`👑 Owner ID     : ${OWNER_ID}`);
+    console.log(`💵 Markup       : Rp ${MARKUP_HARGA.toLocaleString("id-ID")}`);
+    console.log(`💰 Min Top Up   : Rp ${MIN_TOPUP.toLocaleString("id-ID")}`);
     console.log(`📁 Database     : ${path.resolve(DB_PATH)}`);
 
     ensureDBDir();
