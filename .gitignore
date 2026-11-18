@@ -1,6 +1,10 @@
 ﻿node_modules/
+database/deposit.json
+database/orderan.json
+database/user.json
 package-lock.json
 .env
 .env.local
 .env.*.local
 .DS_Store
+.env.bak
