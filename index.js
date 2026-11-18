@@ -118,16 +118,28 @@ async function runSetup() {
 
     rl.close();
 
-    let envData = "";
-    envData += `BOT_TOKEN=${botToken}\n`;
-    envData += `OWNER_ID=${ownerId}\n`;
-    envData += `API_KEY=${apiKey}\n`;
-    envData += `CHANNEL_USERNAME=${channelUsername}\n`;
-    if (baseUrl) envData += `BASE_URL=${baseUrl}\n`;
-    envData += `SERVER_ID=${serverId}\n`;
-    const MARKUP_HARGA = 1000;
+    // Build .env with EXACT order & keys requested
+    const newEnv = {
+        BOT_TOKEN: botToken,
+        OWNER_ID: ownerId,
+        API_KEY: existingEnv.API_KEY || "",
+        CHANNEL_USERNAME: channelUsername,
+        CHANNEL_NOTIF: channelNotif,
+        BASE_URL: existingEnv.BASE_URL || DEFAULT_VALUES.BASE_URL,
+        SERVER_ID: existingEnv.SERVER_ID || DEFAULT_VALUES.SERVER_ID,
+        OPERATOR: existingEnv.OPERATOR || DEFAULT_VALUES.OPERATOR,
+    };
 
-    fs.writeFileSync(".env", envData);
+    writeEnvFile(newEnv);
+
+    // === VERIFY: pastikan tidak ada key wajib yang kosong ===
+    const verify = parseEnvFile();
+    const stillMissing = REQUIRED_KEYS.filter(k => !clean(verify[k]));
+    if (stillMissing.length > 0) {
+        console.error("\n❌ SETUP GAGAL! Key wajib masih kosong:", stillMissing.join(", "));
+        console.error("💡 Periksa izin tulis folder & coba lagi.\n");
+        process.exit(1);
+    }
 
     console.log("\n╔══════════════════════════════════════════╗");
     console.log("║  ✅  KONFIGURASI BERHASIL DISIMPAN       ║");
@@ -182,8 +194,16 @@ const BOT_TOKEN = clean(process.env.BOT_TOKEN);
 const OWNER_ID = Number(clean(process.env.OWNER_ID));
 const API_KEY = clean(process.env.API_KEY);
 const CHANNEL_USERNAME = clean(process.env.CHANNEL_USERNAME);
-const BASE_URL = clean(process.env.BASE_URL) || "";
-const SERVER_ID = clean(process.env.SERVER_ID) || "1";
+const CHANNEL_NOTIF = clean(process.env.CHANNEL_NOTIF);
+const BASE_URL = clean(process.env.BASE_URL) || DEFAULT_VALUES.BASE_URL;
+const SERVER_ID = clean(process.env.SERVER_ID) || DEFAULT_VALUES.SERVER_ID;
+const OPERATOR = clean(process.env.OPERATOR) || DEFAULT_VALUES.OPERATOR;
+const MARKUP_HARGA = Number(clean(process.env.MARKUP_HARGA)) || 1000;
+const MIN_TOPUP = 2000;
+const CANCEL_WAIT_MS = 3 * 60 * 1000;       // 3 menit (user manual cancel)
+const AUTO_CANCEL_AFTER_MS = 5 * 60 * 1000; // 5 menit (auto-cancel sistem)
+const MAX_PENDING_DEPOSITS = 10;            // provider limit
+const WORKER_INTERVAL_MS = 1000;            // 1 detik per deposit (round-robin)
 
 if (!BOT_TOKEN || !OWNER_ID || !CHANNEL_USERNAME || !CHANNEL_NOTIF) {
     console.error("❌ Error: BOT_TOKEN, OWNER_ID, CHANNEL_USERNAME, atau CHANNEL_NOTIF belum diset!");
@@ -487,25 +507,21 @@ bot.use(async (ctx, next) => {
 /* ============================
     ====== HELPER FUNCTION ======
     ============================ */
-/**
- * Edit pesan existing (caption + reply_markup ATOMIC) atau kirim baru.
- * - Pesan existing dari bot ini selalu berupa photo (logo) → pakai editMessageCaption
- * - Kalau ternyata teks → fallback editMessageText
- * - Tidak re-upload media → tombol tidak flicker/hilang
- */
 async function editOrSendMessage(ctx, caption, options, photo) {
     try {
         if (ctx.callbackQuery) {
-            if (photo && fs.existsSync(photo)) {
-                await ctx.editMessageMedia({
-                    type: "photo",
-                    media: { source: fs.createReadStream(photo) },
-                    caption: caption,
-                    parse_mode: options.parse_mode
-                });
-                await ctx.editMessageReplyMarkup(options.reply_markup);
-            } else {
-                await ctx.editMessageText(caption, options);
+            try {
+                await ctx.editMessageCaption(caption, options);
+                return;
+            } catch (e1) {
+                if (e1.message.includes("message is not modified")) return;
+                try {
+                    await ctx.editMessageText(caption, options);
+                    return;
+                } catch (e2) {
+                    if (e2.message.includes("message is not modified")) return;
+                    throw e2;
+                }
             }
         } else {
             if (photo && fs.existsSync(photo)) {
@@ -528,6 +544,88 @@ async function editOrSendMessage(ctx, caption, options, photo) {
             throw error;
         }
     }
+}
+
+async function editOrSendPhotoURL(ctx, url, caption, options) {
+    try {
+        if (ctx.callbackQuery) {
+            try {
+                await ctx.editMessageMedia({ type: "photo", media: url, caption, ...options });
+                return;
+            } catch (e) {
+                if (e.message.includes("message is not modified")) return;
+                console.error("editMessageMedia error:", e.message);
+            }
+        }
+        await ctx.replyWithPhoto(url, { caption, ...options });
+    } catch (e) {
+        console.error("editOrSendPhotoURL:", e.message);
+        try { await ctx.reply(caption, options); } catch (e2) { console.error("fallback:", e2.message); }
+    }
+}
+
+function applyMarkup(price) {
+    const base = Number(price);
+    if (!Number.isFinite(base) || base <= 0) return price;
+    return base + MARKUP_HARGA;
+}
+
+function formatRupiah(n) {
+    return Number(n || 0).toLocaleString("id-ID");
+}
+
+function formatDateTime(iso) {
+    try {
+        const d = new Date(String(iso).replace(" ", "T"));
+        if (isNaN(d.getTime())) return iso;
+        return d.toLocaleString("id-ID");
+    } catch { return iso; }
+}
+
+function statusLabel(status) {
+    const s = String(status || "").toLowerCase();
+    if (s === "success") return "✅ SUCCESS";
+    if (s === "batal" || s === "cancel" || s === "cancelled") return "❌ BATAL";
+    if (s === "expired") return "⏰ EXPIRED";
+    if (s === "failed") return "❌ FAILED";
+    return "⏳ PENDING";
+}
+
+async function getOwnerStats() {
+    const db = loadDB();
+    let totalUserSaldo = 0;
+    let userCount = 0;
+    for (const [key, val] of Object.entries(db)) {
+        if (Number(key) === OWNER_ID) continue;
+        totalUserSaldo += Number(val.saldo || 0);
+        userCount++;
+    }
+
+    let apiBalance = 0;
+    let apiName = "Owner";
+    let apiEmail = "-";
+    let apiOk = false;
+    try {
+        if (API_KEY) {
+            const res = await axios.get(`${BASE_URL}/profile?apikey=${API_KEY}`, { timeout: 10000 });
+            apiBalance = Number(res.data.balance) || 0;
+            apiName = res.data.name || "Owner";
+            apiEmail = res.data.email || "-";
+            apiOk = true;
+        }
+    } catch (e) {
+        console.error("owner profile fetch error:", e.message);
+    }
+
+    return {
+        apiBalance,
+        totalUserSaldo,
+        available: apiBalance - totalUserSaldo,
+        userCount,
+        apiName,
+        apiEmail,
+        apiOk
+    };
 }
 
 /* ============================
@@ -1475,157 +1573,6 @@ bot.action("profile", async (ctx) => {
 });
 
 /* ============================
-    ====== FITUR TOP UP =========
-    ============================ */
-const topupState = new Map(); // userId -> { amount: string }
-
-function getTopupAmount(userId) {
-    const s = topupState.get(userId);
-    return s ? s.amount : "";
-}
-
-function setTopupAmount(userId, amount) {
-    topupState.set(userId, { amount: String(amount || "").slice(0, 9) });
-}
-
-function clearTopupAmount(userId) {
-    topupState.delete(userId);
-}
-
-function buildTopupScreen(userId) {
-    const amountStr = getTopupAmount(userId);
-    const amountNum = Number(amountStr) || 0;
-    const display = amountStr === "" ? "0" : formatRupiah(amountNum);
-    const isEnough = amountNum >= MIN_TOPUP;
-
-    const caption = `
-💰 <b>TOP UP SALDO</b>
-━━━━━━━━━━━━━━━━━━━━
-
-Nominal: <b>Rp ${display}</b>
-Minimal: <b>Rp ${formatRupiah(MIN_TOPUP)}</b>
-
-${amountStr === "" ? "⌨️ <i>Tekan tombol angka di bawah untuk memasukkan nominal.</i>" :
-    isEnough ? "✅ <i>Nominal valid. Tekan <b>Lanjut</b> untuk melanjutkan.</i>"
-             : `⚠️ <i>Nominal masih di bawah minimal Rp ${formatRupiah(MIN_TOPUP)}.</i>`}
-`.trim();
-
-    const buttons = [
-        [
-            Markup.button.callback("1", "tp_1"),
-            Markup.button.callback("2", "tp_2"),
-            Markup.button.callback("3", "tp_3"),
-        ],
-        [
-            Markup.button.callback("4", "tp_4"),
-            Markup.button.callback("5", "tp_5"),
-            Markup.button.callback("6", "tp_6"),
-        ],
-        [
-            Markup.button.callback("7", "tp_7"),
-            Markup.button.callback("8", "tp_8"),
-            Markup.button.callback("9", "tp_9"),
-        ],
-        [
-            Markup.button.callback("0", "tp_0"),
-            Markup.button.callback("⌫ Hapus", "tp_del"),
-            Markup.button.callback("🗑️ Clear", "tp_clear"),
-        ],
-        [
-            Markup.button.callback("✅ Lanjut", "tp_next"),
-        ],
-        [
-            Markup.button.callback("🏠 Menu Utama", "start"),
-        ],
-    ];
-
-    return {
-        caption,
-        options: {
-            parse_mode: "HTML",
-            reply_markup: Markup.inlineKeyboard(buttons).reply_markup
-        }
-    };
-}
-
-bot.action("topup", async (ctx) => {
-    clearTopupAmount(ctx.from.id);
-    const { caption, options } = buildTopupScreen(ctx.from.id);
-    await editOrSendMessage(ctx, caption, options, LOGO_PATH);
-    await ctx.answerCbQuery().catch(() => {});
-});
-
-bot.action(/^tp_(\d)$/, async (ctx) => {
-    const digit = ctx.match[1];
-    const current = getTopupAmount(ctx.from.id);
-    let next = current + digit;
-
-    // hindari angka nol di depan (kecuali single "0")
-    if (current === "0") next = digit;
-    if (current === "" && digit === "0") next = "0";
-    if (next.length > 9) next = next.slice(0, 9);
-
-    setTopupAmount(ctx.from.id, next);
-    const { caption, options } = buildTopupScreen(ctx.from.id);
-    await editOrSendMessage(ctx, caption, options, LOGO_PATH);
-    await ctx.answerCbQuery().catch(() => {});
-});
-
-bot.action("tp_del", async (ctx) => {
-    const current = getTopupAmount(ctx.from.id);
-    const next = current.slice(0, -1);
-    setTopupAmount(ctx.from.id, next);
-    const { caption, options } = buildTopupScreen(ctx.from.id);
-    await editOrSendMessage(ctx, caption, options, LOGO_PATH);
-    await ctx.answerCbQuery().catch(() => {});
-});
-
-bot.action("tp_clear", async (ctx) => {
-    clearTopupAmount(ctx.from.id);
-    const { caption, options } = buildTopupScreen(ctx.from.id);
-    await editOrSendMessage(ctx, caption, options, LOGO_PATH);
-    await ctx.answerCbQuery().catch(() => {});
-});
-
-bot.action("tp_next", async (ctx) => {
-    const amountStr = getTopupAmount(ctx.from.id);
-    const amount = Number(amountStr) || 0;
-
-    if (amount < MIN_TOPUP) {
-        return ctx.answerCbQuery(
-            `❌ Minimal top up Rp ${formatRupiah(MIN_TOPUP)}`,
-            { show_alert: true }
-        ).catch(() => {});
-    }
-
-    await ctx.answerCbQuery("✅ Nominal valid").catch(() => {});
-
-    const caption = `
-🧾 <b>KONFIRMASI TOP UP</b>
-━━━━━━━━━━━━━━━━━━━━
-
-🆔 <b>ID</b>       : <code>${ctx.from.id}</code>
-👤 <b>Nama</b>     : ${ctx.from.first_name || "-"}
-💰 <b>Nominal</b>  : <b>Rp ${formatRupiah(amount)}</b>
-
-<i>Silakan hubungi owner untuk instruksi pembayaran.</i>
-
-⚠️ <b>PENTING:</b>
-Saldo akan ditambahkan setelah pembayaran dikonfirmasi oleh admin.
-`.trim();
-
-    const options = {
-        parse_mode: "HTML",
-        reply_markup: Markup.inlineKeyboard([
-            [Markup.button.url("💬 Hubungi Owner", "https://t.me/dpwoffc")],
-            [Markup.button.callback("🏠 Menu Utama", "start")]
-        ]).reply_markup
-    };
-
-    await editOrSendMessage(ctx, caption, options, LOGO_PATH);
-});
-
-/* ============================
     ==== CHECK JOIN CALLBACK ====
     ============================ */
 bot.action("check_join", async (ctx) => {
@@ -1666,7 +1613,8 @@ bot.start(async (ctx) => {
     ====== CALLBACK START =======
     ============================ */
 bot.action("start", async (ctx) => {
-    const { caption, options } = createMainMenu(ctx.from.id, ctx.from.first_name);
+    clearTopupAmount(ctx.from.id);
+    const { caption, options } = await createMainMenu(ctx.from.id, ctx.from.first_name);
     await editOrSendMessage(ctx, caption, options, LOGO_PATH);
 });
 
@@ -1687,10 +1635,23 @@ bot.catch((err, ctx) => {
     console.log("╔══════════════════════════════════════════╗");
     console.log("║  🤖 BOT OTP BY DPW                       ║");
     console.log("╚══════════════════════════════════════════╝");
-    console.log(`📸 Logo         : ${fs.existsSync(LOGO_PATH) ? "✅ Ada" : "⚠️  Tidak ditemukan"}`);
-    console.log(`📢 Channel      : ${CHANNEL_USERNAME}`);
-    console.log(`👑 Owner ID     : ${OWNER_ID}`);
-    console.log(`📁 Database     : ${path.resolve(DB_PATH)}`);
+    console.log(`📸 Logo          : ${fs.existsSync(LOGO_PATH) ? "✅ Ada" : "⚠️  Tidak ditemukan"}`);
+    console.log(`📢 Channel Utama : ${CHANNEL_USERNAME}`);
+    console.log(`🔔 Channel Notif : ${CHANNEL_NOTIF}`);
+    console.log(`👑 Owner ID      : ${OWNER_ID}`);
+    console.log(`🔑 API Key       : ${API_KEY ? "✅ Set" : "❌ Belum diset"}`);
+    console.log(`🌐 Base URL      : ${BASE_URL}`);
+    console.log(`🖥️ Server ID     : ${SERVER_ID}`);
+    console.log(`⚙️  Operator      : ${OPERATOR}`);
+    console.log(`💵 Markup        : Rp ${MARKUP_HARGA.toLocaleString("id-ID")}`);
+    console.log(`💰 Min Top Up    : Rp ${MIN_TOPUP.toLocaleString("id-ID")}`);
+    console.log(`⏱️  Cancel Wait   : ${CANCEL_WAIT_MS / 1000} detik (manual)`);
+    console.log(`⏰ Auto-Cancel   : ${AUTO_CANCEL_AFTER_MS / 1000} detik (sistem)`);
+    console.log(`🚫 Max Pending   : ${MAX_PENDING_DEPOSITS} deposit (global)`);
+    console.log(`👤 Per User      : 1 deposit aktif`);
+    console.log(`🔁 Worker        : tiap ${WORKER_INTERVAL_MS}ms (round-robin)`);
+    console.log(`📁 Database      : ${path.resolve(DB_PATH)}`);
+    console.log(`📁 Deposits      : ${path.resolve(DEPOSIT_PATH)}`);
 
     ensureDBDir();
     loadDB();
