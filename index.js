@@ -628,9 +628,6 @@ async function getOwnerStats() {
     };
 }
 
-/* ============================
-    ====== MAIN MENU ============
-    ============================ */
 async function createMainMenu(id, firstName) {
     const isOwner = Number(id) === OWNER_ID;
     const date = new Date().toLocaleDateString("id-ID", {
