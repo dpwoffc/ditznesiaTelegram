@@ -2,7 +2,6 @@
 database/deposit.json
 database/orderan.json
 database/user.json
-package-lock.json
 .env
 .env.local
 .env.*.local
